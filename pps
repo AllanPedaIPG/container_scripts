@@ -1,0 +1,159 @@
+#!/bin/env python3
+# -*- mode: python -*-
+
+import subprocess as sp
+from collections import OrderedDict
+from optparse    import OptionParser
+import pprint    as pp
+import sys
+import os
+import array
+import re
+
+
+class PodPSResults:
+    def __init__(self):
+        pods_to_services = map_pods_to_services()
+        pipe = sp.Popen(['podman',
+                         'ps',    '--no-trunc',
+                         '--pod', '--all',
+                         '--format',
+                         '{{.Pod}}\t{{.ID}}\t{{.PodName}}\t{{.Image}}\t{{.Names}}\t{{.Status}}'],
+                        universal_newlines=True, stdout=sp.PIPE, stderr=sp.PIPE)
+        self.od = OrderedDict()
+        # length will be expanded as necessary for table row data
+        self.header = OrderedDict({'pod id':       len('pod id'),
+                                   'container id': len('container id'),
+                                   'pod name':     len('pod_name'),
+                                   'service':      len('service'),
+                                   'image':        len('image'),
+                                   'names':        len('names'),
+                                   'status':       len('status')})
+        rc = pipe.wait()
+        out,err = pipe.communicate()
+        if rc != 0:
+            print('The podman ps command returned an error: ',err)
+            exit(1)
+        else:
+            for line in out.splitlines():
+                arr = line.split('\t')
+                pod_id   = arr[0]
+                if self.header['pod id'] < len(pod_id):
+                    self.header['pod id'] = len(pod_id) 
+                cnt_id   = arr[1]
+                if self.header['container id'] < len(cnt_id):
+                    self.header['container id'] = len(cnt_id)
+                if arr[2] == '':
+                    pod_name = '-'
+                else:
+                    pod_name = arr[2]
+                if self.header['pod name'] < len(pod_name):
+                    self.header['pod name'] = len(pod_name)
+                img_name = arr[3]
+                if self.header['image'] < len(img_name):
+                    self.header['image'] = len(img_name)
+                cnt_name = arr[4]
+                if self.header['names'] < len(cnt_name):
+                    self.header['names'] = len(cnt_name)
+                statdesc = arr[5]
+                if self.header['status'] < len(statdesc):
+                    self.header['status'] = len(statdesc)
+                service_name = '-'
+                if (pod_name in pods_to_services) and (len(pods_to_services[pod_name]) > 0):
+                    service_name = pods_to_services[pod_name]
+                if self.header['service'] < len(service_name):
+                    self.header['service'] = len(service_name)
+                # this is the order they will be diplayed
+                self.od[pod_id+cnt_id] = OrderedDict({'pod id':       pod_id,
+                                                      'container id': cnt_id,
+                                                      'pod name':     pod_name,
+                                                      'service':      service_name,
+                                                      'image':        img_name,
+                                                      'names':        cnt_name,
+                                                      'status':       statdesc })
+
+    def print_pods(self):
+        # print( '%s %s %s %s %s %s %s' % tuple(self.header.keys()) )
+        # value is string width
+        for hd in self.header:
+            if hd == 'pod id' or hd == 'container id':
+                continue
+            print('%s ' % hd.upper().ljust(self.header[hd], ' '), end='')
+        print()
+        # header dict contains max elem length as value
+        for row_key in self.od:
+            row = self.od[row_key]
+            for cell_key in row:
+                if cell_key == 'pod id' or cell_key == 'container id':
+                    continue
+                print('%s ' % row[cell_key].ljust( self.header[cell_key],' '), end='' )
+            print()
+
+
+def get_service_file_from_service_name( service_name ):
+    # systemctl show --user --property=FragmentPath pod_ct_rhel8_php8_wp.service
+    pipe = sp.Popen( [ 'systemctl', 'show', '--user', '--property=FragmentPath', service_name ],
+                     universal_newlines=True, stdout=sp.PIPE, stderr=sp.PIPE )
+    rc = pipe.wait()
+    out, err = pipe.communicate()
+    if rc != 0:
+        print('The systemctl FragmentPath command returned an error: ', err)
+        exit(1)
+    else:
+        return re.sub( r'^FragmentPath=', '', out.strip(), flags=re.IGNORECASE )
+
+def lookup_pod_from_service_name( service_name, service_file ):
+    # based on this line of awk
+    # awk '/\<podman +pod +create\>/ {gsub(/^.*name=/,""); print $1}'
+    fh = open( service_file, 'r' )
+    while True:
+        line = fh.readline()
+        if not line:
+            break
+        if re.search( r'\bpodman +pod +create\b', line):
+            rm_left_str = re.sub( r'^.*name=', '', line.strip() )
+            return( re.sub( r' .*', '', rm_left_str ) )
+
+# returns dictionary of service mapped to defining file and pod name
+def map_pods_to_services():
+    pipe = sp.Popen([ 'env',
+                      'TERM=dumb', 'PAGER=""', 'systemctl',
+                      'list-units', '--user', '--type=service', '--all'],
+                     universal_newlines=True, stdout=sp.PIPE, stderr=sp.PIPE)
+    rc = pipe.wait()
+    od = OrderedDict()
+    out,err = pipe.communicate()
+    if rc != 0:
+        print('The systemctl command returned an error: ',err)
+        exit(1)
+    else:
+        header = True
+        for line in out.splitlines():
+            svc_file_path = None
+            svc_name = None
+            if header:
+                header = False
+                next
+            else:
+                if( len(line) == 0 ):
+                    break
+                else:
+                    svc_name = re.sub(' .*', '', line)
+                    svc_file_path = get_service_file_from_service_name( svc_name )
+                    if ( not svc_name ) or ( not svc_file_path ):
+                        next
+                    else:
+                        # extract pod name via regex
+                        pod_name = lookup_pod_from_service_name( svc_name, svc_file_path )
+                        if pod_name:
+                             od[pod_name] = svc_name
+    return(od)
+# map_pods_to_services()
+
+def main():
+    pspr = PodPSResults()
+    pspr.print_pods()
+
+if __name__ == "__main__":
+    main()
+
